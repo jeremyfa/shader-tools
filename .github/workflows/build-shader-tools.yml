@@ -61,9 +61,9 @@ jobs:
           echo "SPIRV-Cross commit hash: $SPIRV_CROSS_COMMIT"
           cd ..
 
-          # Create a combined hash for the release tag (using first 8 chars of each)
-          SHADERC_SHORT=$(echo $SHADERC_COMMIT | cut -c1-8)
-          SPIRV_CROSS_SHORT=$(echo $SPIRV_CROSS_COMMIT | cut -c1-8)
+          # Create a combined hash for the release tag (using first 7 chars of each)
+          SHADERC_SHORT=$(echo $SHADERC_COMMIT | cut -c1-7)
+          SPIRV_CROSS_SHORT=$(echo $SPIRV_CROSS_COMMIT | cut -c1-7)
           COMBINED_HASH="${SHADERC_SHORT}-${SPIRV_CROSS_SHORT}"
 
           # Set outputs
@@ -142,6 +142,9 @@ jobs:
           echo "${{ needs.get-commits.outputs.shaderc_commit }}" > bin/shaderc-commit.txt
           echo "${{ needs.get-commits.outputs.spirv_cross_commit }}" > bin/spirv-cross-commit.txt
 
+          # Remove the .commit directory since we have separate commit files
+          rm -rf bin/.commit
+
           # Create zip archive
           cd bin
           zip -r ../shader-tools-mac-universal.zip *
@@ -182,7 +185,7 @@ jobs:
           Write-Host "Setting up Visual Studio environment"
 
           # Set up Visual Studio Environment
-          if (${{ matrix.arch }} -eq "arm64") {
+          if ("${{ matrix.arch }}" -eq "arm64") {
             $ArchArg = "arm64"
           } else {
             $ArchArg = "x64"
@@ -241,8 +244,25 @@ jobs:
           Set-Content -Path bin/shaderc-commit.txt -Value "${{ needs.get-commits.outputs.shaderc_commit }}"
           Set-Content -Path bin/spirv-cross-commit.txt -Value "${{ needs.get-commits.outputs.spirv_cross_commit }}"
 
-          # Create zip archive
-          Compress-Archive -Path bin/* -DestinationPath shader-tools-windows-${{ matrix.arch }}.zip -Force
+          # Remove the .commit directory since we have separate commit files
+          if (Test-Path bin/.commit) {
+            Remove-Item -Path bin/.commit -Recurse -Force
+          }
+
+          # Create a temporary directory for files to include in archive
+          New-Item -Path archive-content -ItemType Directory -Force
+
+          # Copy only the relevant files (avoiding .commit directory)
+          Copy-Item bin/glslc.exe archive-content/
+          Copy-Item bin/spirv-cross.exe archive-content/
+          Copy-Item bin/shaderc-commit.txt archive-content/
+          Copy-Item bin/spirv-cross-commit.txt archive-content/
+
+          # Add any other necessary files
+          Get-ChildItem -Path bin -Exclude .commit | Copy-Item -Destination archive-content -Recurse
+
+          # Create zip archive from the filtered content
+          Compress-Archive -Path archive-content/* -DestinationPath shader-tools-windows-${{ matrix.arch }}.zip -Force
 
       - name: Upload Windows Archive
         uses: actions/upload-artifact@v4
@@ -315,6 +335,9 @@ jobs:
           # Create commit files with the commit hashes
           echo "${{ needs.get-commits.outputs.shaderc_commit }}" > bin/shaderc-commit.txt
           echo "${{ needs.get-commits.outputs.spirv_cross_commit }}" > bin/spirv-cross-commit.txt
+
+          # Remove the .commit directory since we have separate commit files
+          rm -rf bin/.commit
 
           # Create tar.gz archive
           cd bin
