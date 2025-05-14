@@ -1,0 +1,402 @@
+name: Build Shader Tools
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0'  # Run every Sunday at midnight UTC
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-shader-tools.yml'
+      - 'scripts/build'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-shader-tools.yml'
+      - 'scripts/build'
+
+# Add permissions at the workflow level
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  get-commits:
+    name: Determine Shader Tool Commit Hashes and Check Existing Release
+    runs-on: ubuntu-latest
+    outputs:
+      shaderc_commit: ${{ steps.get-commits.outputs.shaderc_commit }}
+      spirv_cross_commit: ${{ steps.get-commits.outputs.spirv_cross_commit }}
+      combined_hash: ${{ steps.get-commits.outputs.combined_hash }}
+      release_exists: ${{ steps.check-release.outputs.release_exists }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git
+
+      - name: Get Latest Shader Tool Commits
+        id: get-commits
+        run: |
+          # Clone just enough of the repos to get the latest commits
+          echo "Cloning shaderc repository..."
+          git clone --depth 1 https://github.com/google/shaderc.git temp-shaderc
+          cd temp-shaderc
+          SHADERC_COMMIT=$(git rev-parse HEAD)
+          echo "shaderc commit hash: $SHADERC_COMMIT"
+          cd ..
+
+          echo "Cloning SPIRV-Cross repository..."
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Cross.git temp-spirv-cross
+          cd temp-spirv-cross
+          SPIRV_CROSS_COMMIT=$(git rev-parse HEAD)
+          echo "SPIRV-Cross commit hash: $SPIRV_CROSS_COMMIT"
+          cd ..
+
+          # Create a combined hash for the release tag (using first 8 chars of each)
+          SHADERC_SHORT=$(echo $SHADERC_COMMIT | cut -c1-8)
+          SPIRV_CROSS_SHORT=$(echo $SPIRV_CROSS_COMMIT | cut -c1-8)
+          COMBINED_HASH="${SHADERC_SHORT}-${SPIRV_CROSS_SHORT}"
+
+          # Set outputs
+          echo "shaderc_commit=$SHADERC_COMMIT" >> $GITHUB_OUTPUT
+          echo "spirv_cross_commit=$SPIRV_CROSS_COMMIT" >> $GITHUB_OUTPUT
+          echo "combined_hash=$COMBINED_HASH" >> $GITHUB_OUTPUT
+
+          # Clean up
+          rm -rf temp-shaderc
+          rm -rf temp-spirv-cross
+
+      - name: Check if Release Exists
+        id: check-release
+        run: |
+          RELEASE_EXISTS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/shader-tools-${{ steps.get-commits.outputs.combined_hash }}" | \
+            jq -r '.id')
+
+          if [[ "$RELEASE_EXISTS" == "null" || "$RELEASE_EXISTS" == "" ]]; then
+            echo "Release does not exist"
+            echo "release_exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "Release already exists with ID: $RELEASE_EXISTS"
+            echo "release_exists=true" >> $GITHUB_OUTPUT
+          fi
+
+  build-mac:
+    name: Build Shader Tools for macOS
+    needs: [get-commits]
+    # Only run if release doesn't exist
+    if: needs.get-commits.outputs.release_exists == 'false'
+    runs-on: macos-14
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Git Repositories
+        run: |
+          # Create directory structure
+          mkdir -p git
+
+          # Clone shaderc
+          git clone https://github.com/google/shaderc.git git/shaderc
+          cd git/shaderc
+          git checkout ${{ needs.get-commits.outputs.shaderc_commit }}
+          cd ../..
+
+          # Clone SPIRV-Cross
+          git clone https://github.com/KhronosGroup/SPIRV-Cross.git git/SPIRV-Cross
+          cd git/SPIRV-Cross
+          git checkout ${{ needs.get-commits.outputs.spirv_cross_commit }}
+          cd ../..
+
+          # Create bin directory
+          mkdir -p bin
+          mkdir -p bin/.commit
+
+      - name: Build Shader Tools
+        run: |
+          node scripts/build --force-rebuild
+
+      - name: Check Build Output
+        run: |
+          ls -la bin/
+          file bin/glslc
+          file bin/spirv-cross
+
+      - name: Create macOS Archive
+        run: |
+          # Create commit files with the commit hashes
+          echo "${{ needs.get-commits.outputs.shaderc_commit }}" > bin/shaderc-commit.txt
+          echo "${{ needs.get-commits.outputs.spirv_cross_commit }}" > bin/spirv-cross-commit.txt
+
+          # Create zip archive
+          cd bin
+          zip -r ../shader-tools-mac-universal.zip *
+          cd ..
+
+      - name: Upload macOS Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: shader-tools-mac-universal
+          path: shader-tools-mac-universal.zip
+          retention-days: 7
+
+  build-windows:
+    name: Build Shader Tools for Windows
+    needs: [get-commits]
+    # Only run if release doesn't exist
+    if: needs.get-commits.outputs.release_exists == 'false'
+    runs-on: windows-2025
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup Visual Studio environment
+        run: |
+          Write-Host "Setting up Visual Studio environment"
+
+          # Set up Visual Studio Environment
+          if (${{ matrix.arch }} -eq "arm64") {
+            $ArchArg = "arm64"
+          } else {
+            $ArchArg = "x64"
+          }
+
+          # Set environment variables for the script
+          echo "VS_ARCH=$ArchArg" >> $env:GITHUB_ENV
+
+      - name: Setup Git Repositories
+        run: |
+          # Create directory structure
+          New-Item -Path git -ItemType Directory -Force
+
+          # Clone shaderc
+          git clone https://github.com/google/shaderc.git git/shaderc
+          Set-Location git/shaderc
+          git checkout ${{ needs.get-commits.outputs.shaderc_commit }}
+          Set-Location ../..
+
+          # Clone SPIRV-Cross
+          git clone https://github.com/KhronosGroup/SPIRV-Cross.git git/SPIRV-Cross
+          Set-Location git/SPIRV-Cross
+          git checkout ${{ needs.get-commits.outputs.spirv_cross_commit }}
+          Set-Location ../..
+
+          # Create bin directory
+          New-Item -Path bin -ItemType Directory -Force
+          New-Item -Path bin/.commit -ItemType Directory -Force
+
+      - name: Build Shader Tools
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=${{ matrix.arch }}
+          node scripts/build --force-rebuild
+
+      - name: Check Build Output
+        run: |
+          Get-ChildItem -Path bin/
+          if (Test-Path "bin/glslc.exe") {
+            Write-Host "glslc.exe exists"
+          } else {
+            Write-Host "ERROR: glslc.exe not found"
+            exit 1
+          }
+
+          if (Test-Path "bin/spirv-cross.exe") {
+            Write-Host "spirv-cross.exe exists"
+          } else {
+            Write-Host "ERROR: spirv-cross.exe not found"
+            exit 1
+          }
+
+      - name: Create Windows Archive
+        run: |
+          # Create commit files with the commit hashes
+          Set-Content -Path bin/shaderc-commit.txt -Value "${{ needs.get-commits.outputs.shaderc_commit }}"
+          Set-Content -Path bin/spirv-cross-commit.txt -Value "${{ needs.get-commits.outputs.spirv_cross_commit }}"
+
+          # Create zip archive
+          Compress-Archive -Path bin/* -DestinationPath shader-tools-windows-${{ matrix.arch }}.zip -Force
+
+      - name: Upload Windows Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: shader-tools-windows-${{ matrix.arch }}
+          path: shader-tools-windows-${{ matrix.arch }}.zip
+          retention-days: 7
+
+  build-linux:
+    name: Build Shader Tools for Linux
+    needs: [get-commits]
+    # Only run if release doesn't exist
+    if: needs.get-commits.outputs.release_exists == 'false'
+    strategy:
+      matrix:
+        include:
+          - os: "ubuntu-22.04"
+            arch: "x64"
+          - os: "ubuntu-22.04-arm"
+            arch: "arm64"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            python3 python-is-python3 git
+
+      - name: Setup Git Repositories
+        run: |
+          # Create directory structure
+          mkdir -p git
+
+          # Clone shaderc
+          git clone https://github.com/google/shaderc.git git/shaderc
+          cd git/shaderc
+          git checkout ${{ needs.get-commits.outputs.shaderc_commit }}
+          cd ../..
+
+          # Clone SPIRV-Cross
+          git clone https://github.com/KhronosGroup/SPIRV-Cross.git git/SPIRV-Cross
+          cd git/SPIRV-Cross
+          git checkout ${{ needs.get-commits.outputs.spirv_cross_commit }}
+          cd ../..
+
+          # Create bin directory
+          mkdir -p bin
+          mkdir -p bin/.commit
+
+      - name: Build Shader Tools
+        run: |
+          node scripts/build --force-rebuild
+
+      - name: Check Build Output
+        run: |
+          ls -la bin/
+          file bin/glslc
+          file bin/spirv-cross
+
+      - name: Create Linux Archive
+        run: |
+          # Create commit files with the commit hashes
+          echo "${{ needs.get-commits.outputs.shaderc_commit }}" > bin/shaderc-commit.txt
+          echo "${{ needs.get-commits.outputs.spirv_cross_commit }}" > bin/spirv-cross-commit.txt
+
+          # Create tar.gz archive
+          cd bin
+          tar -czvf ../shader-tools-linux-${{ matrix.arch }}.tar.gz *
+          cd ..
+
+      - name: Upload Linux Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: shader-tools-linux-${{ matrix.arch }}
+          path: shader-tools-linux-${{ matrix.arch }}.tar.gz
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [get-commits, build-mac, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    # Run on schedule, manual triggers, or push to main (but not PRs)
+    # And only if the release doesn't already exist
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.get-commits.outputs.release_exists == 'false'
+    # Add permissions specifically for this job
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p release-assets
+
+          # Create a standalone commit files
+          echo "${{ needs.get-commits.outputs.shaderc_commit }}" > release-assets/shaderc-commit.txt
+          echo "${{ needs.get-commits.outputs.spirv_cross_commit }}" > release-assets/spirv-cross-commit.txt
+
+          # Find and copy the artifacts
+          find artifacts/shader-tools-mac-universal -name "*.zip" -exec cp {} release-assets/shader-tools-mac-universal.zip \;
+          find artifacts/shader-tools-windows-x64 -name "*.zip" -exec cp {} release-assets/shader-tools-windows-x64.zip \;
+          find artifacts/shader-tools-windows-arm64 -name "*.zip" -exec cp {} release-assets/shader-tools-windows-arm64.zip \;
+          find artifacts/shader-tools-linux-x64 -name "*.tar.gz" -exec cp {} release-assets/shader-tools-linux-x64.tar.gz \;
+          find artifacts/shader-tools-linux-arm64 -name "*.tar.gz" -exec cp {} release-assets/shader-tools-linux-arm64.tar.gz \;
+
+          echo "Prepared release assets:"
+          ls -la release-assets/
+
+      - name: Get Current Date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh
+
+      - name: Create Release
+        id: create-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the files to upload
+          RELEASE_FILES=$(find release-assets -name "*.zip" -o -name "*.tar.gz" -o -name "*-commit.txt" | tr '\n' ' ')
+
+          # Create release with GitHub CLI
+          gh release create "shader-tools-${{ needs.get-commits.outputs.combined_hash }}" \
+            --title "Shader Tools ${{ steps.date.outputs.date }} (${{ needs.get-commits.outputs.combined_hash }})" \
+            --notes "Automated build of shader tools (glslc and spirv-cross)
+
+            Built on ${{ steps.date.outputs.date }}
+
+            **Source Commits:**
+            - shaderc: [${{ needs.get-commits.outputs.shaderc_commit }}](https://github.com/google/shaderc/commit/${{ needs.get-commits.outputs.shaderc_commit }})
+            - SPIRV-Cross: [${{ needs.get-commits.outputs.spirv_cross_commit }}](https://github.com/KhronosGroup/SPIRV-Cross/commit/${{ needs.get-commits.outputs.spirv_cross_commit }})
+
+            **Prebuilt binaries:**
+            - macOS (Universal)
+            - Windows (x64 and ARM64)
+            - Linux (x64 and ARM64)" \
+            $RELEASE_FILES
